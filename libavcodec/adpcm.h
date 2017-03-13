@@ -43,6 +43,13 @@ typedef struct ADPCMChannelStatus {
     int coeff1;
     int coeff2;
     int idelta;
+
+    int samples_in_block;
+    int filter;
+    int shift;
+    int flag;
+    int has_header;
+    int has_flag;
 } ADPCMChannelStatus;
 
 #endif /* AVCODEC_ADPCM_H */

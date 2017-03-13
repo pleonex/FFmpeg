@@ -92,6 +92,7 @@ typedef struct ADPCMDecodeContext {
     ADPCMChannelStatus status[14];
     int vqa_version;                /**< VQA version. Used for ADPCM_IMA_WS */
     int has_status;
+    int current_channel;
 } ADPCMDecodeContext;
 
 static av_cold int adpcm_decode_init(AVCodecContext * avctx)
@@ -99,6 +100,7 @@ static av_cold int adpcm_decode_init(AVCodecContext * avctx)
     ADPCMDecodeContext *c = avctx->priv_data;
     unsigned int min_channels = 1;
     unsigned int max_channels = 2;
+    int i;
 
     switch(avctx->codec->id) {
     case AV_CODEC_ID_ADPCM_DTK:
@@ -117,10 +119,13 @@ static av_cold int adpcm_decode_init(AVCodecContext * avctx)
         max_channels = 8;
         break;
     case AV_CODEC_ID_ADPCM_PSX:
-        av_log(avctx, AV_LOG_TRACE, "coded %d block %d\n",
-          avctx->bits_per_coded_sample,
-          avctx->block_align);
         max_channels = 8;
+        c->current_channel = 0;
+        for (i = 0; i < avctx->channels; i++) {
+            c->status[i].samples_in_block = 0;
+            c->status[i].has_header = 0;
+            c->status[i].has_flag = 0;
+        }
         break;
     case AV_CODEC_ID_ADPCM_IMA_DAT4:
     case AV_CODEC_ID_ADPCM_THP:
@@ -1650,50 +1655,71 @@ static int adpcm_decode_frame(AVCodecContext *avctx, void *data,
         }
         break;
     case AV_CODEC_ID_ADPCM_PSX:
-        if (gb.buffer_end - gb.buffer < avctx->channels * 16) {
-            av_log(avctx, AV_LOG_DEBUG, "Not enough data\n");
-            break;
-        }
+        /* Implemented in a loop so it only reads a byte per iteration */
+        while (gb.buffer_end != gb.buffer) {
+            int data;
+            int i;
+            int channel = c->current_channel;
 
-        for (channel = 0; channel < avctx->channels; channel++) {
+            cs = &(c->status[channel]);
             samples = samples_p[channel];
 
-            /* Read in every sample for this channel.  */
-            for (i = 0; i < nb_samples / 28; i++) {
-                int filter, shift, flag, byte;
-
-                filter = bytestream2_get_byteu(&gb);
-                av_log(avctx, AV_LOG_TRACE, "Filter: %x\n", filter);
-
-                shift  = filter & 0xf;
-                filter = filter >> 4;
-                if (filter >= FF_ARRAY_ELEMS(xa_adpcm_table)) {
-                  av_log(avctx, AV_LOG_ERROR, "Missing coeff table %d\n", filter);
+            /* Read block header if starting block */
+            if (cs->samples_in_block == 0 && !cs->has_header) {
+                int header = bytestream2_get_byteu(&gb);
+                av_log(avctx, AV_LOG_TRACE, "Header 0x%x\n", header);
+                cs->shift = header & 0x0f;
+                cs->filter = (header >> 4) & 0x0f;
+                if (cs->filter >= FF_ARRAY_ELEMS(xa_adpcm_table)) {
+                    av_log(avctx, AV_LOG_ERROR, "Invalid filter %d\n", cs->filter);
                     return AVERROR_INVALIDDATA;
-                  }
-                flag   = bytestream2_get_byteu(&gb);
-                av_log(avctx, AV_LOG_TRACE, "Flag: %x\n", flag);
-
-                /* Decode 28 samples.  */
-                for (n = 0; n < 28; n++) {
-                    int sample = 0, scale;
-
-                    if (flag < 0x07) {
-                        if (n & 1) {
-                            scale = sign_extend(byte >> 4, 4);
-                        } else {
-                            byte  = bytestream2_get_byteu(&gb);
-                            av_log(avctx, AV_LOG_TRACE, "Scale: %x\n", byte);
-                            scale = sign_extend(byte, 4);
-                        }
-
-                        scale  = scale << 12;
-                        sample = (int)((scale >> shift) + (c->status[channel].sample1 * xa_adpcm_table[filter][0] + c->status[channel].sample2 * xa_adpcm_table[filter][1]) / 64);
-                    }
-                    *samples++ = av_clip_int16(sample);
-                    c->status[channel].sample2 = c->status[channel].sample1;
-                    c->status[channel].sample1 = sample;
                 }
+
+                cs->has_header = 1;
+                continue;
+            }
+
+            if (cs->samples_in_block == 0 && !cs->has_flag) {
+                cs->flag = bytestream2_get_byteu(&gb);
+                av_log(avctx, AV_LOG_TRACE, "Flag 0x%x\n", cs->flag);
+                cs->has_flag = 1;
+                continue;
+            }
+
+            /* We have the header, so starts reading samples */
+            if (cs->flag < 0x07) {
+                data = bytestream2_get_byteu(&gb);
+                av_log(avctx, AV_LOG_TRACE, "Data 0x%x\n", data);
+            }
+
+            for (i = 0; i < 2; i++) {
+                int sample = 0;
+                int scale = 0;
+
+                if (cs->flag < 0x07) {
+                    scale = sign_extend(data >> (i * 4), 4);
+                    scale = scale << 12;
+                    sample = (int)(
+                        (scale >> cs->shift) +
+                        (cs->sample1 * xa_adpcm_table[cs->filter][0] +
+                         cs->sample2 * xa_adpcm_table[cs->filter][1]) / 64);
+                }
+
+                av_log(avctx, AV_LOG_TRACE, "Sample out 0x%x\n", av_clip_int16(sample));
+                *samples++ = av_clip_int16(sample);
+                cs->sample2 = cs->sample1;
+                cs->sample1 = sample;
+            }
+
+            cs->samples_in_block += 2;
+            if (cs->samples_in_block == 28) {
+                cs->samples_in_block = 0;
+                cs->has_header = 0;
+                cs->has_flag = 0;
+
+                c->current_channel++;
+                if (c->current_channel >= avctx->channels)
+                    c->current_channel = 0;
             }
         }
         break;
