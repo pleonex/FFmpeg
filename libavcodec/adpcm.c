@@ -57,12 +57,17 @@
  */
 
 /* These are for CD-ROM XA ADPCM */
-static const int xa_adpcm_table[5][2] = {
+static const int xa_adpcm_table[10][2] = {
     {   0,   0 },
     {  60,   0 },
     { 115, -52 },
     {  98, -55 },
-    { 122, -60 }
+    { 122, -60 },
+    {   0,   0 },
+    {  -60,   0 },
+    { -115, 52 },
+    { -98, 55 },
+    { -122, 60 }
 };
 
 static const int ea_adpcm_table[] = {
@@ -112,6 +117,9 @@ static av_cold int adpcm_decode_init(AVCodecContext * avctx)
         max_channels = 8;
         break;
     case AV_CODEC_ID_ADPCM_PSX:
+        av_log(avctx, AV_LOG_TRACE, "coded %d block %d\n",
+          avctx->bits_per_coded_sample,
+          avctx->block_align);
         max_channels = 8;
         break;
     case AV_CODEC_ID_ADPCM_IMA_DAT4:
@@ -121,7 +129,7 @@ static av_cold int adpcm_decode_init(AVCodecContext * avctx)
         break;
     }
     if (avctx->channels < min_channels || avctx->channels > max_channels) {
-        av_log(avctx, AV_LOG_ERROR, "Invalid number of channels\n");
+        av_log(avctx, AV_LOG_ERROR, "Invalid number of channels %d\n", avctx->channels);
         return AVERROR(EINVAL);
     }
 
@@ -721,10 +729,18 @@ static int adpcm_decode_frame(AVCodecContext *avctx, void *data,
     int nb_samples, coded_samples, approx_nb_samples, ret;
     GetByteContext gb;
 
+    if (((uint32_t *)buf)[0] == 0x64685353) {
+        av_log(avctx, AV_LOG_TRACE, "Decoding header skipped\n");
+        buf += 0x28;
+        buf_size -= 0x28;
+    }
+
     bytestream2_init(&gb, buf, buf_size);
     nb_samples = get_nb_samples(avctx, &gb, buf_size, &coded_samples, &approx_nb_samples);
-    if (nb_samples <= 0) {
-        av_log(avctx, AV_LOG_ERROR, "invalid number of samples in packet\n");
+    av_log(avctx, AV_LOG_TRACE, "samples %d for 0x%x\n", nb_samples, buf_size);
+
+    if (nb_samples < 0) {
+        av_log(avctx, AV_LOG_ERROR, "invalid number of samples in packet %d %d\n", nb_samples, buf_size);
         return AVERROR_INVALIDDATA;
     }
 
@@ -1634,6 +1650,11 @@ static int adpcm_decode_frame(AVCodecContext *avctx, void *data,
         }
         break;
     case AV_CODEC_ID_ADPCM_PSX:
+        if (gb.buffer_end - gb.buffer < avctx->channels * 16) {
+            av_log(avctx, AV_LOG_DEBUG, "Not enough data\n");
+            break;
+        }
+
         for (channel = 0; channel < avctx->channels; channel++) {
             samples = samples_p[channel];
 
@@ -1642,11 +1663,16 @@ static int adpcm_decode_frame(AVCodecContext *avctx, void *data,
                 int filter, shift, flag, byte;
 
                 filter = bytestream2_get_byteu(&gb);
+                av_log(avctx, AV_LOG_TRACE, "Filter: %x\n", filter);
+
                 shift  = filter & 0xf;
                 filter = filter >> 4;
-                if (filter >= FF_ARRAY_ELEMS(xa_adpcm_table))
+                if (filter >= FF_ARRAY_ELEMS(xa_adpcm_table)) {
+                  av_log(avctx, AV_LOG_ERROR, "Missing coeff table %d\n", filter);
                     return AVERROR_INVALIDDATA;
+                  }
                 flag   = bytestream2_get_byteu(&gb);
+                av_log(avctx, AV_LOG_TRACE, "Flag: %x\n", flag);
 
                 /* Decode 28 samples.  */
                 for (n = 0; n < 28; n++) {
@@ -1657,6 +1683,7 @@ static int adpcm_decode_frame(AVCodecContext *avctx, void *data,
                             scale = sign_extend(byte >> 4, 4);
                         } else {
                             byte  = bytestream2_get_byteu(&gb);
+                            av_log(avctx, AV_LOG_TRACE, "Scale: %x\n", byte);
                             scale = sign_extend(byte, 4);
                         }
 
@@ -1676,8 +1703,9 @@ static int adpcm_decode_frame(AVCodecContext *avctx, void *data,
     }
 
     if (avpkt->size && bytestream2_tell(&gb) == 0) {
-        av_log(avctx, AV_LOG_ERROR, "Nothing consumed\n");
-        return AVERROR_INVALIDDATA;
+        av_log(avctx, AV_LOG_WARNING, "Nothing consumed\n");
+        *got_frame_ptr = 0;
+        return 0;
     }
 
     *got_frame_ptr = 1;
