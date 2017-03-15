@@ -473,7 +473,6 @@ static int mpegps_read_packet(AVFormatContext *s,
     int len, startcode, i, es_type, ret;
     int lpcm_header_len = -1; //Init to suppress warning
     int request_probe= 0;
-    int just_parsed = 0;
     enum AVCodecID codec_id = AV_CODEC_ID_NONE;
     enum AVMediaType type;
     int64_t pts, dts, dummy_pos; // dummy_pos is needed for the index building to work
@@ -582,8 +581,8 @@ redo:
         type     = AVMEDIA_TYPE_AUDIO;
         codec_id = AV_CODEC_ID_AC3;
     } else if (startcode == 0xff) {
-        type = AVMEDIA_TYPE_AUDIO;
-        codec_id = AV_CODEC_ID_ADPCM_PSX;
+        type = AVMEDIA_TYPE_DATA;
+        codec_id = AV_CODEC_ID_BIN_DATA;
     } else if (startcode >= 0x20 && startcode <= 0x3f) {
         type     = AVMEDIA_TYPE_SUBTITLE;
         codec_id = AV_CODEC_ID_DVD_SUBTITLE;
@@ -612,61 +611,6 @@ skip:
     st->request_probe     = request_probe;
     st->need_parsing      = AVSTREAM_PARSE_FULL;
 
-    if (startcode == 0xff) {
-        unsigned char subId;
-        unsigned int streamId;
-        subId = avio_r8(s->pb);
-        streamId = avio_rl16(s->pb); len -= 2;
-        just_parsed = 1;
-
-        if (streamId != 0x00)
-            av_log(s, AV_LOG_ERROR, "[PS2]: Invalid stream ID\n");
-
-        if (subId == 0xa1 || subId == 0xa0) {
-            unsigned int headerId;
-            unsigned int format;
-
-            headerId = avio_rb32(s->pb); len -= 4;
-            avio_rl32(s->pb); len -= 4; /* length */
-            if (headerId != 0x53536864) {
-                /* Expected header */
-                av_log(s, AV_LOG_ERROR, "[PS2]: ERROR HEADER %X\n", headerId);
-            }
-
-            format = avio_rl32(s->pb); len -= 4;
-            st->codecpar->sample_rate = avio_rl32(s->pb); len -= 4;
-            st->codecpar->channels = avio_rl32(s->pb); len -= 4;
-            st->codecpar->bits_per_coded_sample = 16 * 8;
-            st->codecpar->block_align = st->codecpar->channels * st->codecpar->bits_per_coded_sample / 8;
-            avio_rl32(s->pb); len -= 4; /* bytesPerChannel */
-            avio_rl32(s->pb); len -= 4; /* Reserved */
-            avio_rl32(s->pb); len -= 4; /* Reserved */
-
-            if (format == 0x10) {
-                st->codecpar->codec_id = AV_CODEC_ID_ADPCM_PSX;
-            } else if (format == 0x01) {
-                /* Some PCM but don't know at this moment */
-                av_log(s, AV_LOG_ERROR, "[PS2]: Uknown PCM\n");
-            }
-
-            st->codecpar->bit_rate = st->codecpar->sample_rate * 8LL * st->codecpar->block_align;
-
-            /* Get the next header ID */
-            headerId = avio_rb32(s->pb); len -= 4;
-            /*avio_rl32(s->pb); len -= 4;*/ /* length */
-            av_log(s, AV_LOG_TRACE, "Length %d vs header length %d\n",
-              len,
-              avio_rl32(s->pb));
-            len -= 4;
-            if (headerId != 0x53536264) {
-                /* Expected audio data */
-                av_log(s, AV_LOG_ERROR, "[PS2]: ERROR HEADER %X\n", headerId);
-            }
-        } else if (subId == 0x90) {
-            av_log(s, AV_LOG_ERROR, "[PS2]: AC-3 or Subs found, not supported\n");
-        }
-   }
-
 found:
     if (st->discard >= AVDISCARD_ALL)
         goto skip;
@@ -677,16 +621,11 @@ found:
             avio_skip(s->pb, 6);
             len -=6;
       }
-    } else if (startcode == 0xff && !just_parsed) {
-        unsigned char subId = avio_r8(s->pb);
-        unsigned int streamId = avio_rl16(s->pb);
-        len -= 3;
-        if ((subId != 0xA0 && subId != 0xA1) || streamId != 0x00)
+    } else if (startcode == 0xff) {
+        unsigned char subId = avio_r8(s->pb); len--;
+        avio_rl16(s->pb); len -= 2; /* stream ID */
+        if (subId != 0xA0 && subId != 0xA1)
             av_log(s, AV_LOG_ERROR, "[PS2]: Invalid audio\n");
-        av_log(s, AV_LOG_TRACE, "[PS2]: Length %d Byte0: %x Pos: %x\n",
-            len,
-            s->pb->buf_ptr[0],
-            s->pb->pos);
     }
     ret = av_get_packet(s->pb, pkt, len);
 
